@@ -1,0 +1,222 @@
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::version()
+# If your bioconductor version is previous to 3.9, see the section bellow
+
+## Required
+BiocManager::install(c("AUCell", "RcisTarget"))
+BiocManager::install(c("GENIE3")) # Optional. Can be replaced by GRNBoost
+
+## Optional (but highly recommended):
+# To score the network on cells (i.e. run AUCell):
+BiocManager::install(c("zoo", "mixtools", "rbokeh"))
+# For various visualizations and perform t-SNEs:
+BiocManager::install(c("DT", "NMF", "pheatmap", "R2HTML", "Rtsne"))
+# To support paralell execution (not available in Windows):
+BiocManager::install(c("doMC", "doRNG"))
+# To export/visualize in http://scope.aertslab.org
+if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+devtools::install_github("aertslab/SCopeLoomR", build_vignettes = TRUE)
+
+检查一下核心依赖包的版本，并确保版本符合以下要求：
+AUCell >=1.4.1 (minimum 1.2.4)；
+RcisTarget>=1.2.0 (minimum 1.0.2)；
+GENIE3>=1.4.0 (minimum 1.2.1)
+packageVersion("AUCell")
+packageVersion("RcisTarget")
+packageVersion("GENIE3")
+
+if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+devtools::install_github("aertslab/SCENIC") 
+packageVersion("SCENIC")
+
+##1, For human:
+dbFiles <- c("https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg19/refseq_r45/mc9nr/gene_based/hg19-500bp-upstream-7species.mc9nr.feather",
+"https://resources.aertslab.org/cistarget/databases/homo_sapiens/hg19/refseq_r45/mc9nr/gene_based/hg19-tss-centered-10kb-7species.mc9nr.feather")
+# mc9nr: Motif collection version 9: 24k motifs
+
+##2, For mouse:
+dbFiles <- c("https://resources.aertslab.org/cistarget/databases/mus_musculus/mm9/refseq_r45/mc9nr/gene_based/mm9-500bp-upstream-7species.mc9nr.feather",
+"https://resources.aertslab.org/cistarget/databases/mus_musculus/mm9/refseq_r45/mc9nr/gene_based/mm9-tss-centered-10kb-7species.mc9nr.feather")
+# mc9nr: Motif collection version 9: 24k motifs
+
+##3, For fly:
+dbFiles <- c("https://resources.aertslab.org/cistarget/databases/drosophila_melanogaster/dm6/flybase_r6.02/mc8nr/gene_based/dm6-5kb-upstream-full-tx-11species.mc8nr.feather")
+# mc8nr: Motif collection version 8: 20k motifs
+
+##4, download
+dir.create("cisTarget_databases");   #创建一个文件夹保存数据库
+setwd("cisTarget_databases")
+#如果3个参考数据库都想下载，每次设置变量dbFiles后，都要运行以下代码
+for(featherURL in dbFiles)
+{
+  download.file(featherURL, destfile=basename(featherURL)) # saved in current dir
+}
+
+
+library(Seurat)
+library(tidyverse)
+library(patchwork)
+library(SCENIC)
+rm(list=ls())
+
+##==分析准备==##
+dir.create("SCENIC")
+dir.create("SCENIC/int")
+scRNA <- readRDS("scRNA.rds")
+setwd("~/project/10xDemo2/SCENIC") 
+##准备细胞meta信息
+cellInfo <- data.frame(scRNA@meta.data)
+colnames(cellInfo)[which(colnames(cellInfo)=="orig.ident")] <- "sample"
+colnames(cellInfo)[which(colnames(cellInfo)=="seurat_clusters")] <- "cluster"
+colnames(cellInfo)[which(colnames(cellInfo)=="celltype_Monaco")] <- "celltype"
+cellInfo <- cellInfo[,c("sample","cluster","celltype")]
+saveRDS(cellInfo, file="int/cellInfo.Rds")
+##准备表达矩阵
+#为了节省计算资源，随机抽取1000个细胞的数据子集
+subcell <- sample(colnames(scRNA),1000)
+scRNAsub <- scRNA[,subcell]
+saveRDS(scRNAsub, "scRNAsub.rds")
+exprMat <- as.matrix(scRNAsub@assays$RNA@counts)
+##设置分析环境
+mydbDIR <- "./cisTarget"
+mydbs <- c("hg38__refseq-r80__500bp_up_and_100bp_down_tss.mc9nr.feather",
+           "hg38__refseq-r80__10kb_up_and_down_tss.mc9nr.feather")
+names(mydbs) <- c("500bp", "10kb")
+scenicOptions <- initializeScenic(org="hgnc", 
+                                  nCores=8,
+                                  dbDir=mydbDIR, 
+                                  dbs = mydbs,
+                                  datasetTitle = "HNSCC")
+saveRDS(scenicOptions, "int/scenicOptions.rds")
+SCENIC正式分析的第一步是计算转录因子与每个基因的相关性，此步骤消耗的计算资源非常大，作者建议两个策略处理大数据集：
+采用GENIE3推断共表达模块时随机抽取少量细胞计算，计算regulons的活性时，所有细胞都代入运算；
+使用python版本的SCENIC，作者强烈推荐。
+genesKept <- geneFiltering(exprMat, scenicOptions, 
+              minCountsPerGene = 3 * 0.01 * ncol(exprMat), 
+              minSamples = ncol(exprMat) * 0.01)
+exprMat_filtered <- exprMat[genesKept, ]
+##计算相关性矩阵
+runCorrelation(exprMat_filtered, scenicOptions)
+##TF-Targets相关性回归分析
+exprMat_filtered_log <- log2(exprMat_filtered+1)
+runGenie3(exprMat_filtered_log, scenicOptions, nParts = 20)
+#这一步消耗的计算资源非常大，个人电脑需要几个小时的运行时间
+
+runGenie3(exprMat_filtered_log, scenicOptions, nParts = 20)需要注意nParts参数，它的作用是把表达矩阵分成n份分开计算，目的是防止数据量大时内存不够。以上代码运行后，int目录下有不少中间结果产生，简要解释一下：
+1.2_corrMat.Rds：基因之间的相关性矩阵
+1.3_GENIE3_weightMatrix_part_1.Rds等：GENIE3的中间结果
+1.4_GENIE3_linkList.Rds：GENIE3最终结果，是把“1.3_”开头的文件合并在一起。
+TF是转录因子名称，Target是潜在靶基因的名字，weight是TF与Target之间的相关性权重。
+上一步计算了转录因子与每一个基因的相关性，接下来需要过滤低相关性的组合形成共表达基因集（模块）。作者尝试了多种策略（标准）过滤低相关性TF-Target，研究发现没有一种最佳策略，因此他们的建议是6种过滤标准都用。这6种方法分别是：
+w001：以每个TF为核心保留weight>0.001的基因形成共表达模块；
+w005：以每个TF为核心保留weight>0.005的基因形成共表达模块；
+top50：以每个TF为核心保留weight值top50的基因形成共表达模块；
+top5perTarget：每个基因保留weight值top5的TF得到精简的TF-Target关联表，然后把基因分配给TF构建共表达模块；
+top10perTarget：每个基因保留weight值top10的TF得到精简的TF-Target关联表，然后把基因分配给TF构建共表达模块；
+top50perTarget：每个基因保留weight值top50的TF得到精简的TF-Target关联表，然后把基因分配给TF构建共表达模块；
+
+##推断共表达模块
+runSCENIC_1_coexNetwork2modules(scenicOptions)
+主要运行结果是int目录下的1.6_tfModules_asDF.Rds
+
+method是上面提到的6种方法，corr是runCorrelation(exprMat_filtered, scenicOptions)命令得到的，1代表激活，-1代表抑制，0代表中性，SCENIC只会采用corr值为1的数据用于后续分析。
+经过上述分析每个转录因子都找到了强相关的靶基因，很多基因调控网络分析到此就结束了。SCENIC的创新之处是对此结果提出了质疑，并通过以下步骤修剪共表达模块形成有生物学意义的调控单元（regulons）：
+对每个共表达模块进行motif富集分析，保留显著富集的motif；此项分析依赖gene-motif评分（排行）数据库，其行为基因、列为motif、值为排名，就是我们下载的cisTarget数据库。
+使用数据库对motif进行TF注释，注释结果分高、低可信度 。数据库直接注释和同源基因推断的TF是高可信结果，使用motif序列相似性注释的TF是低可信结果。
+用保留的motif对共表达模块内的基因进行打分（同样依据cisTarget数据库），识别显著高分的基因（理解为motif离这些基因的TSS很近）；
+删除共表达模块内与motif评分不高的基因，剩下的基因集作者称为调控单元（regulon）。
+
+##推断转录调控网络（regulon）
+runSCENIC_2_createRegulons(scenicOptions)
+#以上代码可增加参数coexMethod=c("w001", "w005", "top50", "top5perTarget", "top10perTarget", "top50perTarget"))
+#默认6种方法的共表达网络都计算，可以少选几种方法以减少计算量
+
+
+##==regulon活性评分与可视化==##
+##regulons计算AUC值并进行下游分析
+exprMat_all <- as.matrix(scRNA@assays$RNA@counts)
+exprMat_all <- log2(exprMat_all+1)
+runSCENIC_3_scoreCells(scenicOptions, exprMat=exprMat_all)
+
+
+#使用shiny互动调整阈值
+aucellApp <- plotTsne_AUCellApp(scenicOptions, exprMat_all)
+savedSelections <- shiny::runApp(aucellApp)
+#保存调整后的阈值
+newThresholds <- savedSelections$thresholds
+scenicOptions@fileNames$int["aucell_thresholds",1] <- "int/newThresholds.Rds"
+saveRDS(newThresholds, file=getIntName(scenicOptions, "aucell_thresholds"))
+saveRDS(scenicOptions, file="int/scenicOptions.Rds")
+
+
+runSCENIC_4_aucell_binarize(scenicOptions, exprMat=exprMat_all)
+
+
+##导入原始regulonAUC矩阵
+AUCmatrix <- readRDS("int/3.4_regulonAUC.Rds")
+AUCmatrix <- AUCmatrix@assays@data@listData$AUC
+AUCmatrix <- data.frame(t(AUCmatrix), check.names=F)
+RegulonName_AUC <- colnames(AUCmatrix)
+RegulonName_AUC <- gsub(' \\(','_',RegulonName_AUC)
+RegulonName_AUC <- gsub('\\)','',RegulonName_AUC)
+colnames(AUCmatrix) <- RegulonName_AUC
+scRNAauc <- AddMetaData(scRNA, AUCmatrix)
+scRNAauc@assays$integrated <- NULL
+saveRDS(scRNAauc,'scRNAauc.rds')
+
+##导入二进制regulonAUC矩阵
+BINmatrix <- readRDS("int/4.1_binaryRegulonActivity.Rds")
+BINmatrix <- data.frame(t(BINmatrix), check.names=F)
+RegulonName_BIN <- colnames(BINmatrix)
+RegulonName_BIN <- gsub(' \\(','_',RegulonName_BIN)
+RegulonName_BIN <- gsub('\\)','',RegulonName_BIN)
+colnames(BINmatrix) <- RegulonName_BIN
+scRNAbin <- AddMetaData(scRNA, BINmatrix)
+scRNAbin@assays$integrated <- NULL
+saveRDS(scRNAbin, 'scRNAbin.rds')
+
+##利用Seurat可视化AUC
+dir.create('scenic_seurat')
+#FeaturePlot
+p1 = FeaturePlot(scRNAauc, features='CEBPB_extended_2290g', label=T, reduction = 'tsne')
+p2 = FeaturePlot(scRNAbin, features='CEBPB_extended_2290g', label=T, reduction = 'tsne')
+p3 = DimPlot(scRNA, reduction = 'tsne', group.by = "celltype_Monaco", label=T)
+plotc = p1|p2|p3
+ggsave('scenic_seurat/CEBPB_extended_2290g.png', plotc, width=14 ,height=4)
+
+
+#RidgePlot&VlnPlot
+p1 = RidgePlot(scRNAauc, features = "CEBPB_extended_2290g", group.by="celltype_Monaco") + 
+               theme(legend.position='none')
+p2 = VlnPlot(scRNAauc, features = "CEBPB_extended_2290g", pt.size = 0, group.by="celltype_Monaco") + 
+             theme(legend.position='none')
+plotc = p1 + p2
+ggsave('scenic_seurat/Ridge-Vln_CEBPB_extended_2290g.png', plotc, width=10, height=8)
+
+
+library(pheatmap)
+cellInfo <- readRDS("int/cellInfo.Rds")
+celltype = subset(cellInfo,select = 'celltype')
+AUCmatrix <- t(AUCmatrix)
+BINmatrix <- t(BINmatrix)
+#挑选部分感兴趣的regulons
+my.regulons <- c('ETS1_2372g','ETV7_981g','IRF7_239g','XBP1_854g','ATF4_37g',
+                 'KLF13_78g','ATF6_129g','CREB3L2_619g','TAGLN2_13g',
+                 'STAT1_extended_1808g','CEBPB_extended_2290g','IRF5_extended_422g',
+                 'SPI1_1606g','HMGA1_14g','SPIB_1866g','IRF8_348g','BCL11A_136g',
+                 'EBF1_40g','MAF_45g','BATF_131g','FOXP3_55g','TBX21_388g',
+                 'EOMES_extended_101g','TCF7_extended_31g','LEF1_extended_49g')
+myAUCmatrix <- AUCmatrix[rownames(AUCmatrix)%in%my.regulons,]
+myBINmatrix <- BINmatrix[rownames(BINmatrix)%in%my.regulons,]
+#使用regulon原始AUC值绘制热图
+pheatmap(myAUCmatrix, show_colnames=F, annotation_col=celltype,
+         filename = 'scenic_seurat/myAUCmatrix_heatmap.png',
+         width = 6, height = 5)
+#使用regulon二进制AUC值绘制热图
+pheatmap(myBINmatrix, show_colnames=F, annotation_col=celltype,
+         filename = 'scenic_seurat/myBINmatrix_heatmap.png',
+         color = colorRampPalette(colors = c("white","black"))(100),
+         width = 6, height = 5)
+
+
+
